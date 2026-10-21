@@ -321,7 +321,8 @@ static s64 ntfs_device_unix_io_pread(struct ntfs_device *dev, void *buf,
 	s64 cnt;
 
 	if ((cnt = pread(DEV_FD(dev), buf, count, offset)) < 0) {
-		ntfs_log_perror("Failed to pread device %s", dev->d_name);
+		ntfs_log_perror("Failed to pread device %s at offset %lld for %lld bytes",
+				dev->d_name, (long long)offset, (long long)count);
 		exit(8);
 	}
 

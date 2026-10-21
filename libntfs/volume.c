@@ -88,6 +88,8 @@ static const char *fallback_readonly_msg =
 int fsck_errors;
 int fsck_fixes;
 
+static int ntfs_mount_stream_ready(ntfs_volume *vol, ntfs_attr *na, s64 bytes);
+
 /**
  * ntfs_volume_alloc - Create an NTFS volume object and initialise it
  *
@@ -100,6 +102,19 @@ ntfs_volume *ntfs_volume_alloc(void)
 	return ntfs_calloc(sizeof(ntfs_volume));
 }
 
+/* Mount admission must not repair a record while choosing a recovery source. */
+static int ntfs_mount_record_check(ntfs_volume *vol, MFT_REF mref, MFT_RECORD *m)
+{
+	BOOL fsck = NVolFsck(vol);
+	int ret;
+
+	NVolClearFsck(vol);
+	ret = ntfs_mft_record_check(vol, mref, m);
+	if (fsck)
+		NVolSetFsck(vol);
+	return ret;
+}
+
 static void ntfs_attr_free(ntfs_attr **na)
 {
 	if (na && *na) {
@@ -110,7 +125,7 @@ static void ntfs_attr_free(ntfs_attr **na)
 
 static int ntfs_inode_free(ntfs_inode **ni)
 {
-	int ret = -1;
+	int ret = 0;
 
 	if (ni && *ni) {
 		ret = ntfs_inode_close(*ni);
@@ -126,6 +141,16 @@ static void ntfs_error_set(int *err)
 		*err = errno;
 }
 
+static void ntfs_release_error(ntfs_volume *v, int *err)
+{
+	if (!*err)
+		*err = errno ? errno : EIO;
+	/* A failed final write must not be retried by later inode closes. */
+	NVolSetReadOnly(v);
+	if (v->dev)
+		NDevSetReadOnly(v->dev);
+}
+
 /**
  * __ntfs_volume_release - Destroy an NTFS volume object
  * @v:
@@ -134,45 +159,48 @@ static void ntfs_error_set(int *err)
  *
  * Returns:
  */
-static int __ntfs_volume_release(ntfs_volume *v)
+static int ntfs_volume_release(ntfs_volume *v, BOOL close_device)
 {
 	int err = 0;
 
 	if (ntfs_close_secure(v))
-		ntfs_error_set(&err);
+		ntfs_release_error(v, &err);
 
 	if (ntfs_inode_free(&v->vol_ni))
-		ntfs_error_set(&err);
+		ntfs_release_error(v, &err);
 	/*
 	 * FIXME: Inodes must be synced before closing
 	 * attributes, otherwise unmount could fail.
 	 */
-	if (v->lcnbmp_ni && NInoDirty(v->lcnbmp_ni))
-		ntfs_inode_sync(v->lcnbmp_ni);
+	if (v->lcnbmp_ni && NInoDirty(v->lcnbmp_ni) &&
+			ntfs_inode_sync(v->lcnbmp_ni))
+		ntfs_release_error(v, &err);
 	ntfs_attr_free(&v->lcnbmp_na);
 	if (ntfs_inode_free(&v->lcnbmp_ni))
-		ntfs_error_set(&err);
+		ntfs_release_error(v, &err);
 
-	if (v->mft_ni && NInoDirty(v->mft_ni))
-		ntfs_inode_sync(v->mft_ni);
+	if (v->mft_ni && NInoDirty(v->mft_ni) &&
+			ntfs_inode_sync(v->mft_ni))
+		ntfs_release_error(v, &err);
 	ntfs_attr_free(&v->mftbmp_na);
 	ntfs_attr_free(&v->mft_na);
 	if (ntfs_inode_free(&v->mft_ni))
-		ntfs_error_set(&err);
+		ntfs_release_error(v, &err);
 
-	if (v->mftmirr_ni && NInoDirty(v->mftmirr_ni))
-		ntfs_inode_sync(v->mftmirr_ni);
+	if (v->mftmirr_ni && NInoDirty(v->mftmirr_ni) &&
+			ntfs_inode_sync(v->mftmirr_ni))
+		ntfs_release_error(v, &err);
 	ntfs_attr_free(&v->mftmirr_na);
 	if (ntfs_inode_free(&v->mftmirr_ni))
-		ntfs_error_set(&err);
+		ntfs_release_error(v, &err);
 
-	if (v->dev) {
+	if (v->dev && close_device) {
 		struct ntfs_device *dev = v->dev;
 
 		if (dev->d_ops->sync(dev))
-			ntfs_error_set(&err);
+			ntfs_release_error(v, &err);
 		if (dev->d_ops->close(dev))
-			ntfs_error_set(&err);
+			ntfs_release_error(v, &err);
 	}
 
 	ntfs_free_lru_caches(v);
@@ -184,6 +212,11 @@ static int __ntfs_volume_release(ntfs_volume *v)
 
 	errno = err;
 	return errno ? -1 : 0;
+}
+
+static int __ntfs_volume_release(ntfs_volume *v)
+{
+	return ntfs_volume_release(v, TRUE);
 }
 
 static int ntfs_attr_setup_flag(ntfs_inode *ni)
@@ -251,7 +284,7 @@ static BOOL ntfs_valid_resident_file_name_attr(ntfs_volume *vol,
 	return TRUE;
 }
 
-static int ntfs_mft_load(ntfs_volume *vol)
+static int ntfs_mft_load(ntfs_volume *vol, BOOL use_mirror)
 {
 	VCN next_vcn, last_vcn, highest_vcn;
 	s64 l;
@@ -272,7 +305,8 @@ static int ntfs_mft_load(ntfs_volume *vol)
 	vol->mft_ni->mft_no = FILE_MFT;
 	vol->mft_ni->mrec = mb;
 	/* Can't use any of the higher level functions yet! */
-	l = ntfs_mst_pread(vol->dev, vol->mft_lcn << vol->cluster_size_bits, 1,
+	l = ntfs_mst_pread(vol->dev,
+			(use_mirror ? vol->mftmirr_lcn : vol->mft_lcn) << vol->cluster_size_bits, 1,
 			vol->mft_record_size, mb);
 	if (l != 1) {
 		if (l != -1)
@@ -281,7 +315,7 @@ static int ntfs_mft_load(ntfs_volume *vol)
 		goto error_exit;
 	}
 
-	if (ntfs_mft_record_check(vol, 0, mb))
+	if (ntfs_mount_record_check(vol, 0, mb))
 		goto error_exit;
 
 	if (mb->flags != MFT_RECORD_IN_USE) {
@@ -582,11 +616,11 @@ error_exit:
  *	was found correct, or because we truncated the file system
  *	and the last actual sector might be part of some file.
  *
- *	Returns 0 if successful
+ *	Returns 0 on success, -1 for an unusable candidate, -2 on commit failure.
  */
 
 static int ntfsck_fix_boot_sector(ntfs_volume *vol, char *full_bs,
-		s64 read_sector, s64 fix_sectors, s32 sector_size)
+		s64 read_sector, s64 fix_sectors, s32 sector_size, BOOL write_boot)
 {
 	s64 br;
 	int res;
@@ -614,6 +648,8 @@ static int ntfsck_fix_boot_sector(ntfs_volume *vol, char *full_bs,
 				!ntfs_boot_sector_parse(vol, bs)) {
 			s64 bw;
 
+			if (!write_boot)
+				return 0;
 			ntfs_log_info("The alternate bootsector is usable\n");
 			if (fix_sectors != got_sectors)
 				ntfs_log_info("Set sector count to %lld instead of %lld\n",
@@ -622,15 +658,21 @@ static int ntfsck_fix_boot_sector(ntfs_volume *vol, char *full_bs,
 			/* fix the normal boot sector */
 			ntfs_log_info("Rewriting the bootsector\n");
 			bw = ntfs_pwrite(vol->dev, 0, sector_size, full_bs);
-			if (bw == sector_size)
+			if (bw == sector_size) {
+				if (vol->dev->d_ops->sync(vol->dev)) {
+					ntfs_log_perror("Failed to flush repaired boot sector");
+					return -2;
+				}
 				res = 0;
+			}
 			else {
 				if (bw != -1)
-					errno = EINVAL;
+					errno = EIO;
 				if (!bw)
 					ntfs_log_error("Failed to rewrite the bootsector (size=0)\n");
 				else
 					ntfs_log_perror("Error rewriting the bootsector");
+				return -2;
 			}
 		}
 		if (!res)
@@ -642,7 +684,7 @@ static int ntfsck_fix_boot_sector(ntfs_volume *vol, char *full_bs,
 /**
  * Return: 0 ok, 1 error.
  */
-static BOOL ntfsck_verify_boot_sector(ntfs_volume *vol)
+static BOOL ntfsck_verify_boot_sector(ntfs_volume *vol, BOOL probe)
 {
 	NTFS_BOOT_SECTOR *ntfs_boot;
 	s32 sector_size;
@@ -662,10 +704,28 @@ static BOOL ntfsck_verify_boot_sector(ntfs_volume *vol)
 		ntfs_free(ntfs_boot);
 		return 1;
 	}
+	/* Regular files may not expose a logical sector-size ioctl. */
+	{
+		s32 bpb_size = le16_to_cpu(ntfs_boot->bpb.bytes_per_sector);
 
-	if ((ntfs_boot->jump[0] != 0xeb) ||
+		if (bpb_size > sector_size && bpb_size <= 4096 &&
+				!(bpb_size & (bpb_size - 1))) {
+			ntfs_free(ntfs_boot);
+			sector_size = bpb_size;
+			ntfs_boot = ntfs_malloc(sector_size);
+			if (!ntfs_boot)
+				return 1;
+			if (ntfs_pread(dev, 0, sector_size, ntfs_boot) != sector_size) {
+				ntfs_free(ntfs_boot);
+				errno = EIO;
+				return 1;
+			}
+		}
+	}
+
+	if (!probe && !NVolFsck(vol) && ((ntfs_boot->jump[0] != 0xeb) ||
 			((ntfs_boot->jump[1] != 0x52) && (ntfs_boot->jump[1] != 0x5b)) ||
-			(ntfs_boot->jump[2] != 0x90)) {
+			(ntfs_boot->jump[2] != 0x90))) {
 		ntfs_log_error("Boot sector: Bad jump.\n");
 		ntfs_free(ntfs_boot);
 		return 1;
@@ -675,38 +735,38 @@ static BOOL ntfsck_verify_boot_sector(ntfs_volume *vol)
 			(ntfs_boot_sector_parse(vol, ntfs_boot) == 0))
 		goto out;
 
-	if (NVolFsck(vol)) {
+	if (NVolFsck(vol) || probe) {
 		problem_context_t pctx = {0, };
 
-		fsck_err_found();
-		if (ntfs_fix_problem(vol, PR_BOOT_SECTOR_INVALID, &pctx)) {
+		if (!probe)
+			fsck_err_found();
+		if (probe || ntfs_fix_problem(vol, PR_BOOT_SECTOR_INVALID, &pctx)) {
 			s64 actual_sectors, shown_sectors;
+			int fixed = -1;
 
 			actual_sectors = ntfs_device_size_get(dev, sector_size) - 1;
 			shown_sectors = sle64_to_cpu(ntfs_boot->number_of_sectors);
 			/* first try the actual last sector */
-			if ((actual_sectors > 0) &&
-					!ntfsck_fix_boot_sector(vol, (char *)ntfs_boot, actual_sectors,
-						actual_sectors, sector_size))
-				res = 0;
+			if (actual_sectors > 0)
+				fixed = ntfsck_fix_boot_sector(vol, (char *)ntfs_boot,
+					actual_sectors, actual_sectors, sector_size, !probe);
 
 			/* then try the shown last sector, if less than actual */
-			if (res && (shown_sectors > 0) &&
-					(shown_sectors < actual_sectors) &&
-					!ntfsck_fix_boot_sector(vol, (char *)ntfs_boot, shown_sectors,
-						shown_sectors, sector_size))
-				res = 0;
+			if (fixed == -1 && shown_sectors > 0 &&
+					shown_sectors < actual_sectors)
+				fixed = ntfsck_fix_boot_sector(vol, (char *)ntfs_boot,
+					shown_sectors, shown_sectors, sector_size, !probe);
 
 			/* then try reducing the number of sectors to actual value */
-			if (res && (shown_sectors > actual_sectors) &&
-					!ntfsck_fix_boot_sector(vol, (char *)ntfs_boot, 0, actual_sectors,
-						sector_size))
-				res = 0;
+			if (fixed == -1 && shown_sectors > actual_sectors)
+				fixed = ntfsck_fix_boot_sector(vol, (char *)ntfs_boot,
+					0, actual_sectors, sector_size, !probe);
+			res = fixed != 0;
 			if (res) {
 				ntfs_log_error("Boot sector: failed to fix boot sector\n");
 				ntfs_free(ntfs_boot);
 				return res;
-			} else
+			} else if (!probe)
 				fsck_err_fixed();
 		} else if (res) {
 			ntfs_free(ntfs_boot);
@@ -714,6 +774,7 @@ static BOOL ntfsck_verify_boot_sector(ntfs_volume *vol)
 		}
 	} else {
 		ntfs_log_error("Boot sector: invalid boot sector\n");
+		ntfs_free(ntfs_boot);
 		return 1;
 	}
 
@@ -771,6 +832,13 @@ static int ntfs_recover_mft(ntfs_volume *vol, MFT_RECORD *src_mrec, LCN dest_mft
 		ntfs_log_perror("Error correcting mft record(%"PRIu64") of (%"PRIu64").",
 				mftno, dest_mft);
 		ntfs_free(mwrite);
+		errno = EIO;
+		return -EIO;
+	}
+	/* Do not reload metadata or repair another copy before this write flushes. */
+	if (vol->dev->d_ops->sync(vol->dev)) {
+		ntfs_log_perror("Failed to flush repaired MFT record");
+		ntfs_free(mwrite);
 		return -EIO;
 	}
 
@@ -805,7 +873,7 @@ static int ntfs_recover_mft_from_mftmirr(ntfs_volume *vol, const u64 mftno)
 		goto err_out;
 	}
 
-	if (ntfs_mft_record_check(vol, mftno, mrec)) {
+	if (ntfs_mount_record_check(vol, mftno, mrec)) {
 		err = -EIO;
 		goto err_out;
 	}
@@ -833,8 +901,8 @@ err_out:
  * Return the allocated volume structure on success and NULL on error with
  * errno set to the error code.
  */
-ntfs_volume *ntfs_volume_startup(struct ntfs_device *dev,
-		ntfs_mount_flags flags)
+static ntfs_volume *ntfs_volume_startup_internal(struct ntfs_device *dev,
+		ntfs_mount_flags flags, BOOL probe, BOOL already_open)
 {
 	LCN mft_zone_size, mft_lcn;
 	ntfs_volume *vol;
@@ -872,13 +940,15 @@ ntfs_volume *ntfs_volume_startup(struct ntfs_device *dev,
 #else
 	NVolClearCompression(vol);
 #endif
-	if (flags & NTFS_MNT_RDONLY)
+	if ((flags & NTFS_MNT_RDONLY) || probe)
 		NVolSetReadOnly(vol);
 
-	if (flags & NTFS_MNT_FSCK)
+	if ((flags & NTFS_MNT_FSCK) && !probe)
 		NVolSetFsck(vol);
 
-	if (flags & NTFS_MNT_FS_YES_REPAIR)
+	if (probe)
+		NVolSetFsNoRepair(vol);
+	else if (flags & NTFS_MNT_FS_YES_REPAIR)
 		NVolSetFsYesRepair(vol);
 	else if (flags & NTFS_MNT_FS_ASK_REPAIR)
 		NVolSetFsAskRepair(vol);
@@ -888,7 +958,10 @@ ntfs_volume *ntfs_volume_startup(struct ntfs_device *dev,
 		NVolSetFsNoRepair(vol);
 
 	/* ...->open needs bracketing to compile with glibc 2.7 */
-	if ((dev->d_ops->open)(dev, NVolReadOnly(vol) ? O_RDONLY: O_RDWR)) {
+	/* The probe holds the eventual writer's exclusive handle throughout admission. */
+	if (!already_open && (dev->d_ops->open)(dev,
+			(flags & NTFS_MNT_RDONLY) ? O_RDONLY :
+			O_RDWR | ((probe || (flags & NTFS_MNT_EXCLUSIVE)) ? O_EXCL : 0))) {
 		if (!NVolReadOnly(vol) && (errno == EROFS)) {
 			if ((dev->d_ops->open)(dev, O_RDONLY)) {
 				ntfs_log_perror("Error opening read-only '%s'",
@@ -906,9 +979,12 @@ ntfs_volume *ntfs_volume_startup(struct ntfs_device *dev,
 	}
 	/* Attach the device to the volume. */
 	vol->dev = dev;
+	if (probe)
+		NDevSetReadOnly(dev);
 
-	if (ntfsck_verify_boot_sector(vol)) {
-		errno = EOPNOTSUPP;
+	if (ntfsck_verify_boot_sector(vol, probe)) {
+		if (!errno)
+			errno = EOPNOTSUPP;
 		goto error_exit;
 	}
 
@@ -978,7 +1054,13 @@ ntfs_volume *ntfs_volume_startup(struct ntfs_device *dev,
 
 reload_mft:
 	/* Need to setup $MFT so we can use the library read functions. */
-	if (ntfs_mft_load(vol) < 0) {
+	if (ntfs_mft_load(vol, FALSE) < 0) {
+		/* Read the mirrored bootstrap into memory; never repair during admission. */
+		if (probe) {
+			if (ntfs_mft_load(vol, TRUE))
+				goto error_exit;
+			return vol;
+		}
 		if (try_recover_mft == FALSE) {
 			fsck_err_found();
 			if (ntfs_fix_problem(vol, PR_MOUNT_LOAD_MFT_FAILURE, &pctx)) {
@@ -994,6 +1076,8 @@ reload_mft:
 		goto error_exit;
 	}
 
+	if (probe)
+		return vol;
 	try_recover_mft = FALSE;
 reload_mft_mirr:
 	/* Need to setup $MFTMirr so we can use the write functions, too. */
@@ -1150,6 +1234,7 @@ int ntfs_volume_check_hiberfile(ntfs_volume *vol, int verbose)
 	ntfs_inode *ni;
 	ntfs_attr *na = NULL;
 	int bytes_read, err;
+	int i;
 	char *buf = NULL;
 
 	ni = ntfs_hiberfile_open(vol);
@@ -1168,6 +1253,10 @@ int ntfs_volume_check_hiberfile(ntfs_volume *vol, int verbose)
 		ntfs_log_perror("Failed to open hiberfil.sys data attribute");
 		goto out;
 	}
+	if (na->data_flags || na->initialized_size < NTFS_HIBERFILE_HEADER_SIZE) {
+		errno = EOPNOTSUPP;
+		goto out;
+	}
 
 	bytes_read = ntfs_attr_pread(na, 0, NTFS_HIBERFILE_HEADER_SIZE, buf);
 	if (bytes_read == -1) {
@@ -1178,7 +1267,7 @@ int ntfs_volume_check_hiberfile(ntfs_volume *vol, int verbose)
 		if (verbose)
 			ntfs_log_error("Hibernated non-system partition, "
 					"refused to mount.\n");
-		errno = EPERM;
+		errno = EIO;
 		goto out;
 	}
 	if ((memcmp(buf, "hibr", 4) == 0)
@@ -1188,7 +1277,15 @@ int ntfs_volume_check_hiberfile(ntfs_volume *vol, int verbose)
 		errno = EPERM;
 		goto out;
 	}
-	/* All right, all header bytes are zero */
+	/* Only an entirely zeroed header proves there is no resumable image. */
+	for (i = 0; i < NTFS_HIBERFILE_HEADER_SIZE; ++i) {
+		if (buf[i]) {
+			if (verbose)
+				ntfs_log_error("Unknown hiberfil.sys header; refusing repair.\n");
+			errno = EOPNOTSUPP;
+			goto out;
+		}
+	}
 	errno = 0;
 out:
 	if (na)
@@ -1205,7 +1302,7 @@ out:
  * ntfs_volume_invalidate_hiberfile - discard the hibernation image
  * @vol:    volume holding hiberfil.sys
  *
- * Zero the magic of the hiberfil.sys header so that Windows does not
+ * Zero the hiberfil.sys header so that Windows does not
  * try to resume from a memory image that no longer matches the volume.
  *
  * Return:  0 on success, or when there is nothing to invalidate
@@ -1215,7 +1312,7 @@ int ntfs_volume_invalidate_hiberfile(ntfs_volume *vol)
 {
 	ntfs_inode *ni;
 	ntfs_attr *na;
-	static const char zero_magic[4];
+	static const char zero_header[NTFS_HIBERFILE_HEADER_SIZE];
 	int err = 0;
 
 	ni = ntfs_hiberfile_open(vol);
@@ -1231,17 +1328,85 @@ int ntfs_volume_invalidate_hiberfile(ntfs_volume *vol)
 		goto out;
 	}
 
-	if (na->data_size >= (s64)sizeof(zero_magic) &&
-			ntfs_attr_pwrite(na, 0, sizeof(zero_magic),
-				zero_magic) != sizeof(zero_magic))
+	/* Do not allocate, extend, or publish initialized metadata during admission. */
+	if (!NAttrNonResident(na) || na->data_flags ||
+			na->data_size < (s64)sizeof(zero_header) ||
+			na->initialized_size < (s64)sizeof(zero_header))
+		err = EOPNOTSUPP;
+	else if (ntfs_mount_stream_ready(vol, na, sizeof(zero_header)))
+		err = errno ? errno : EIO;
+	else if (ntfs_rl_pwrite(vol, na->rl, 0, 0, sizeof(zero_header),
+				(void *)zero_header) != sizeof(zero_header))
+		err = errno ? errno : EIO;
+	if (!err && vol->dev->d_ops->sync(vol->dev))
 		err = errno ? errno : EIO;
 
 	ntfs_attr_close(na);
 out:
+	if (err) {
+		NVolSetReadOnly(vol);
+		NDevSetReadOnly(vol->dev);
+	}
 	if (ntfs_inode_close(ni))
 		ntfs_error_set(&err);
+	if (err) {
+		NVolSetReadOnly(vol);
+		NDevSetReadOnly(vol->dev);
+	}
 	errno = err;
 	return err ? -1 : 0;
+}
+
+/*
+ * Admission uses read functions only, on the same exclusive device handle the
+ * repair will use. Alternate boot/$MFT bytes are parsed into this private volume
+ * object, so a repairable bootstrap defect cannot make the probe mutate or fail
+ * merely because the primary copy needs repair. There is no caller-settable
+ * "admission done" bypass flag.
+ */
+ntfs_volume *ntfs_volume_startup(struct ntfs_device *dev, ntfs_mount_flags flags)
+{
+	ntfs_volume *probe;
+	int err;
+	BOOL repair = (flags & NTFS_MNT_FSCK) &&
+			(flags & (NTFS_MNT_FS_YES_REPAIR | NTFS_MNT_FS_ASK_REPAIR |
+			NTFS_MNT_FS_AUTO_REPAIR)) &&
+			!(flags & (NTFS_MNT_RDONLY | NTFS_MNT_FORENSIC | NTFS_MNT_FS_NO_REPAIR));
+
+	if (!repair)
+		return ntfs_volume_startup_internal(dev, flags, FALSE, FALSE);
+	probe = ntfs_volume_startup_internal(dev, flags, TRUE, FALSE);
+	if (!probe)
+		return NULL;
+	errno = 0;
+	if (ntfs_volume_check_hiberfile(probe, 1)) {
+		err = errno ? errno : EIO;
+		if (err == EPERM && (flags & NTFS_MNT_FORCE_HIBERFILE)) {
+			ntfs_log_warning("Discarding the active Windows hibernation image.\n");
+			NVolClearReadOnly(probe);
+			NDevClearReadOnly(dev);
+			if (ntfs_volume_invalidate_hiberfile(probe))
+				err = errno ? errno : EIO;
+			else
+				err = 0;
+			NVolSetReadOnly(probe);
+			NDevSetReadOnly(dev);
+		}
+		if (err) {
+			ntfs_log_error("Cannot establish a safe hibernation state before repair.\n");
+			__ntfs_volume_release(probe);
+			errno = err;
+			return NULL;
+		}
+	}
+	if (ntfs_volume_release(probe, FALSE)) {
+		err = errno;
+		dev->d_ops->close(dev);
+		errno = err;
+		return NULL;
+	}
+	NDevClearReadOnly(dev);
+	return ntfs_volume_startup_internal(dev, flags, FALSE, TRUE);
 }
 
 /*
@@ -1258,54 +1423,77 @@ out:
  *		-1 if there was an error, explained by errno
  */
 
-static int fix_txf_data(ntfs_volume *vol)
+int ntfs_volume_fix_txf_data(ntfs_volume *vol)
 {
-	void *txf_data;
-	s64 txf_data_size;
 	ntfs_inode *ni;
-	ntfs_attr *na;
-	int res;
+	ntfs_attr *na = NULL;
+	void *data = NULL;
+	s64 size;
+	int err = 0;
+	BOOL converted = FALSE;
+	problem_context_t pctx = {0, };
 
-	res = 0;
-	ntfs_log_debug("Loading root directory\n");
 	ni = ntfs_inode_open(vol, FILE_root);
-	if (!ni) {
-		ntfs_log_perror("Failed to open root directory");
-		res = -1;
-	} else {
-		/* Get the $TXF_DATA attribute */
-		na = ntfs_attr_open(ni, AT_LOGGED_UTILITY_STREAM, TXF_DATA, 9);
-		if (na) {
-			if (NAttrNonResident(na)) {
-				/*
-				 * Fix the attribute by truncating, then
-				 * rewriting it.
-				 */
-				ntfs_log_debug("Making $TXF_DATA resident\n");
-				txf_data = ntfs_attr_readall(ni,
-						AT_LOGGED_UTILITY_STREAM,
-						TXF_DATA, 9, &txf_data_size);
-				if (txf_data) {
-					if (ntfs_attr_truncate(na, 0)
-							|| (ntfs_attr_pwrite(na, 0,
-									txf_data_size, txf_data)
-								!= txf_data_size))
-						res = -1;
-					free(txf_data);
-				}
-				if (res)
-					ntfs_log_error("Failed to make $TXF_DATA resident\n");
-				else
-					ntfs_log_error("$TXF_DATA made resident\n");
-			}
-			ntfs_attr_close(na);
-		}
-		if (ntfs_inode_close(ni)) {
-			ntfs_log_perror("Failed to close root");
-			res = -1;
+	if (!ni)
+		return -1;
+	na = ntfs_attr_open(ni, AT_LOGGED_UTILITY_STREAM, TXF_DATA, 9);
+	if (!na) {
+		if (errno != ENOENT)
+			err = errno ? errno : EIO;
+		goto out;
+	}
+	if (!NAttrNonResident(na))
+		goto out;
+	if (NVolFsck(vol)) {
+		fsck_err_found();
+		if (!ntfs_fix_problem(vol, PR_ROOT_TXF_NONRESIDENT, &pctx))
+			goto out;
+		if (!vol->fsck_lcn_bitmap || !vol->fsck_mft_bitmap) {
+			err = EINVAL;
+			goto out;
 		}
 	}
-	return (res);
+	/* A resident value must fit in one record; bound the read before allocating. */
+	if (na->data_size < 0 || na->data_size > vol->mft_record_size) {
+		err = EOPNOTSUPP;
+		goto out;
+	}
+	data = ntfs_attr_readall(ni, AT_LOGGED_UTILITY_STREAM, TXF_DATA, 9, &size);
+	if (!data) {
+		err = errno ? errno : EIO;
+		goto out;
+	}
+	if (ntfs_attr_truncate(na, 0) ||
+			ntfs_attr_pwrite(na, 0, size, data) != size) {
+		err = errno ? errno : EIO;
+		goto out;
+	}
+	converted = TRUE;
+out:
+	free(data);
+	if (na)
+		ntfs_attr_close(na);
+	if (err) {
+		NVolSetReadOnly(vol);
+		NDevSetReadOnly(vol->dev);
+	}
+	if (ntfs_inode_close(ni) && !err)
+		err = errno ? errno : EIO;
+	if (!err && converted && vol->dev->d_ops->sync(vol->dev))
+		err = errno ? errno : EIO;
+	if (err) {
+		NVolSetReadOnly(vol);
+		NDevSetReadOnly(vol->dev);
+		errno = err;
+		ntfs_log_perror("Failed to make $TXF_DATA resident");
+		return -1;
+	}
+	if (converted) {
+		if (NVolFsck(vol))
+			fsck_err_fixed();
+		ntfs_log_info("$TXF_DATA made resident\n");
+	}
+	return 0;
 }
 
 /*
@@ -1368,47 +1556,117 @@ static BOOL ntfs_mftmirr_semantic_valid(ntfs_volume *vol, MFT_RECORD *m,
  *
  * Returns 0 on success, -1 on failure.
  */
-static int ntfs_upcase_repair(ntfs_volume *vol)
+/* Validate every extent before raw mount-time writes can bypass allocation. */
+static int ntfs_mount_stream_ready(ntfs_volume *vol, ntfs_attr *na, s64 bytes)
+{
+	runlist_element *rl;
+	VCN end = 0;
+	VCN needed = (bytes + vol->cluster_size - 1) >> vol->cluster_size_bits;
+
+	if (!NAttrNonResident(na) || na->data_flags || na->allocated_size < bytes) {
+		errno = EOPNOTSUPP;
+		return -1;
+	}
+	if (ntfs_attr_map_whole_runlist(na))
+		return -1;
+	for (rl = na->rl; end < needed && rl->length; ++rl) {
+		if (rl->vcn != end || rl->length < 0 || rl->lcn < 0 ||
+				rl->lcn >= vol->nr_clusters ||
+				rl->length > vol->nr_clusters - rl->lcn) {
+			errno = EIO;
+			return -1;
+		}
+		end += rl->length;
+	}
+	if (end < needed) {
+		errno = EIO;
+		return -1;
+	}
+	return 0;
+}
+
+/* No allocation is permitted until the fsck occupancy maps exist. */
+static int ntfs_mount_stream_repair(ntfs_volume *vol, MFT_REF file,
+		const void *data, s64 bytes)
 {
 	ntfs_inode *ni = NULL;
 	ntfs_attr *na = NULL;
-	ntfschar *uc = NULL;
-	u32 uc_len;
-	s64 uc_bytes;
+	ntfs_attr_search_ctx *ctx = NULL;
 	int ret = -1;
+	int err;
 
-	uc_len = ntfs_upcase_build_default(&uc);
-	if (!uc_len || !uc) {
-		free(uc);
-		return -1;
-	}
-	uc_bytes = (s64)uc_len << 1;
-
-	ni = ntfs_inode_open(vol, FILE_UpCase);
+	ni = ntfs_inode_open(vol, file);
 	if (!ni)
 		goto out;
 	na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
-	if (!na)
+	if (!na || ntfs_mount_stream_ready(vol, na, bytes))
 		goto out;
-
-	if (na->data_size != uc_bytes && ntfs_attr_truncate(na, uc_bytes))
+	/* Publish size metadata only after the replacement data is flushed. */
+	if (ntfs_rl_pwrite(vol, na->rl, 0, 0, bytes, (void *)data) != bytes) {
+		if (!errno)
+			errno = EIO;
 		goto out;
-	if (ntfs_attr_pwrite(na, 0, uc_bytes, uc) != uc_bytes)
+	}
+	if (vol->dev->d_ops->sync(vol->dev))
 		goto out;
-
-	/* Replace the in-core table used by the rest of the mount + fsck. */
-	free(vol->upcase);
-	vol->upcase = uc;
-	vol->upcase_len = uc_len;
-	uc = NULL;
+	if (na->data_size != bytes || na->initialized_size != bytes) {
+		ctx = ntfs_attr_get_search_ctx(ni, NULL);
+		if (!ctx || ntfs_attr_lookup(AT_DATA, AT_UNNAMED, 0, 0,
+				0, NULL, 0, ctx))
+			goto out;
+		ctx->attr->data_size = cpu_to_sle64(bytes);
+		ctx->attr->initialized_size = cpu_to_sle64(bytes);
+		NInoSetDirty(ctx->ntfs_ino);
+		na->data_size = na->initialized_size = bytes;
+#if CACHE_NIDATA_SIZE
+		ni->data_size = bytes;
+#endif
+	}
 	ret = 0;
 out:
+	err = errno;
+	if (ctx)
+		ntfs_attr_put_search_ctx(ctx);
 	if (na)
 		ntfs_attr_close(na);
-	if (ni)
-		ntfs_inode_close(ni);
-	free(uc);
+	if (ret) {
+		NVolSetReadOnly(vol);
+		NDevSetReadOnly(vol->dev);
+	}
+	if (ni && ntfs_inode_close(ni)) {
+		err = errno;
+		ret = -1;
+	}
+	if (!ret && vol->dev->d_ops->sync(vol->dev)) {
+		err = errno;
+		ret = -1;
+	}
+	if (ret) {
+		NVolSetReadOnly(vol);
+		NDevSetReadOnly(vol->dev);
+		errno = err ? err : EIO;
+		ntfs_log_perror("Failed to finalize mount-time stream repair");
+	}
 	return ret;
+}
+
+static int ntfs_upcase_repair(ntfs_volume *vol)
+{
+	ntfschar *uc = NULL;
+	u32 len = ntfs_upcase_build_default(&uc);
+
+	if (!len || !uc) {
+		free(uc);
+		return -1;
+	}
+	if (ntfs_mount_stream_repair(vol, FILE_UpCase, uc, (s64)len << 1)) {
+		free(uc);
+		return -1;
+	}
+	free(vol->upcase);
+	vol->upcase = uc;
+	vol->upcase_len = len;
+	return 0;
 }
 
 /*
@@ -1659,64 +1917,28 @@ static BOOL ntfs_attrdef_check(const ntfs_volume *vol)
 /*
  * ntfs_attrdef_repair - regenerate a corrupt $AttrDef from the default table
  *
- * Writes the canonical NTFS 3.x table back to $AttrDef/$DATA (recreating the
- * $DATA attribute if it is gone entirely) and replaces the in-core copy used
+ * Writes the canonical NTFS 3.x table back to an existing $AttrDef/$DATA
+ * attribute and replaces the in-core copy used
  * by the rest of the mount and by every fsck pass.
  *
  * Returns 0 on success, -1 on failure. When the $DATA attribute still exists,
  * a failure to rewrite the disk still leaves the in-core copy holding the
- * canonical table, so the rest of this mount runs against a trustworthy
- * $AttrDef. A wholly missing $DATA is left untouched (see below) and returns
+ * canonical table. The caller must still abort the mount on a failed repair.
+ * A wholly missing $DATA is left untouched (see below) and returns
  * -1 without altering the in-core copy, so the caller aborts the mount.
  */
 static int ntfs_attrdef_repair(ntfs_volume *vol)
 {
-	ntfs_inode *ni = NULL;
-	ntfs_attr *na = NULL;
-	void *buf;
-	s64 sz = (s64)sizeof(ntfs_attrdef_default);
-	int ret = -1;
+	void *buf = ntfs_malloc(sizeof(ntfs_attrdef_default));
 
-	ni = ntfs_inode_open(vol, FILE_AttrDef);
-	if (!ni)
-		return -1;
-	na = ntfs_attr_open(ni, AT_DATA, AT_UNNAMED, 0);
-	if (!na) {
-		/*
-		 * $DATA is gone entirely. Recreating it means allocating clusters, but
-		 * ntfs_fsck_mount() does not set up the fsck cluster bitmaps until after
-		 * ntfs_mount() returns, so a cluster allocation here would dereference them
-		 * while still NULL.
-		 */
-		ntfs_inode_close(ni);
-		return -1;
-	}
-
-	/*
-	 * Install the canonical table in core first so the truncate/pwrite
-	 * below validate against a trustworthy $AttrDef (it is the very table
-	 * being repaired), and so the rest of the mount runs against a good
-	 * copy even if the disk write fails.
-	 */
-	buf = ntfs_malloc(sz);
 	if (!buf)
-		goto out;
-	memcpy(buf, ntfs_attrdef_default, sz);
+		return -1;
+	memcpy(buf, ntfs_attrdef_default, sizeof(ntfs_attrdef_default));
 	free(vol->attrdef);
-	vol->attrdef = (ATTR_DEF *)buf;
-	vol->attrdef_len = (s32)sz;
-
-	if (na->data_size != sz && ntfs_attr_truncate(na, sz))
-		goto out;
-	if (ntfs_attr_pwrite(na, 0, sz, ntfs_attrdef_default) != sz)
-		goto out;
-	ret = 0;
-out:
-	if (na)
-		ntfs_attr_close(na);
-	if (ni)
-		ntfs_inode_close(ni);
-	return ret;
+	vol->attrdef = buf;
+	vol->attrdef_len = sizeof(ntfs_attrdef_default);
+	return ntfs_mount_stream_repair(vol, FILE_AttrDef,
+			ntfs_attrdef_default, sizeof(ntfs_attrdef_default));
 }
 
 /**
@@ -1819,7 +2041,7 @@ ntfs_volume *ntfs_device_mount(struct ntfs_device *dev, ntfs_mount_flags flags)
 		use_mirr = FALSE;
 
 		/* check mft record of $MFT */
-		if (!ntfs_mft_record_check(vol, FILE_MFT + i, mrec)) {
+		if (!ntfs_mount_record_check(vol, FILE_MFT + i, mrec)) {
 			if (!memcmp(mrec, mrec2, vol->mft_record_size))
 				continue;
 
@@ -1830,7 +2052,7 @@ ntfs_volume *ntfs_device_mount(struct ntfs_device *dev, ntfs_mount_flags flags)
 			 */
 			if (i < 12 &&
 					!ntfs_mftmirr_semantic_valid(vol, mrec, FILE_MFT + i) &&
-					!ntfs_mft_record_check(vol, FILE_MFT + i, mrec2) &&
+					!ntfs_mount_record_check(vol, FILE_MFT + i, mrec2) &&
 					ntfs_mftmirr_semantic_valid(vol, mrec2, FILE_MFT + i)) {
 				fsck_err_found();
 				if (ntfs_fix_problem(vol, PR_MOUNT_REPAIRED_MFTMIRR_CORRUPTED, &pctx)) {
@@ -1856,7 +2078,7 @@ ntfs_volume *ntfs_device_mount(struct ntfs_device *dev, ntfs_mount_flags flags)
 		}
 
 		/* check mft record of $MFTMirror */
-		if (!ntfs_mft_record_check(vol, FILE_MFT + i, mrec2))
+		if (!ntfs_mount_record_check(vol, FILE_MFT + i, mrec2))
 			use_mirr = TRUE;
 
 		if (use_mirr == FALSE) {
@@ -2127,8 +2349,13 @@ upcase_ok:
 	if (!vol->attrdef || !ntfs_attrdef_check(vol)) {
 		if (NVolFsck(vol)) {
 			fsck_err_found();
-			if (ntfs_fix_problem(vol, PR_ATTRDEF_CORRUPTED, &pctx)
-					&& !ntfs_attrdef_repair(vol)) {
+			if (ntfs_fix_problem(vol, PR_ATTRDEF_CORRUPTED, &pctx)) {
+				if (ntfs_attrdef_repair(vol)) {
+					if (!errno)
+						errno = EIO;
+					ntfs_log_perror("Failed to repair $AttrDef");
+					goto error_exit;
+				}
 				ntfs_log_info("$AttrDef regenerated from the "
 						"default table\n");
 				fsck_err_fixed();
@@ -2181,8 +2408,8 @@ upcase_ok:
 			}
 		}
 		/* make $TXF_DATA resident if present on the root directory */
-		if (!(flags & NTFS_MNT_RDONLY) && !need_fallback_ro) {
-			if (fix_txf_data(vol))
+		if (!(flags & (NTFS_MNT_RDONLY | NTFS_MNT_FSCK)) && !need_fallback_ro) {
+			if (ntfs_volume_fix_txf_data(vol))
 				goto error_exit;
 		}
 	}
@@ -2317,9 +2544,14 @@ int ntfs_umount(ntfs_volume *vol, const BOOL force __attribute__((unused)))
 static int ntfs_mntent_check(const char *file, unsigned long *mnt_flags)
 {
 	struct mntent *mnt;
+	struct stat target, source;
 	char *real_file = NULL, *real_fsname = NULL;
 	FILE *f;
 	int err = 0;
+	BOOL found = FALSE;
+
+	if (stat(file, &target))
+		return -1;
 
 	real_file = ntfs_malloc(PATH_MAX + 1);
 	if (!real_file)
@@ -2341,19 +2573,25 @@ static int ntfs_mntent_check(const char *file, unsigned long *mnt_flags)
 	while ((mnt = getmntent(f))) {
 		if (!ntfs_realpath_canonicalize(mnt->mnt_fsname, real_fsname))
 			continue;
-		if (!strcmp(real_file, real_fsname))
-			break;
-	}
-	endmntent(f);
-	if (!mnt)
-		goto exit;
-	*mnt_flags = NTFS_MF_MOUNTED;
-	if (!strcmp(mnt->mnt_dir, "/"))
-		*mnt_flags |= NTFS_MF_ISROOT;
+		if (strcmp(real_file, real_fsname) &&
+				(stat(real_fsname, &source) ||
+				!((S_ISBLK(target.st_mode) && S_ISBLK(source.st_mode) &&
+				target.st_rdev == source.st_rdev) ||
+				(target.st_dev == source.st_dev && target.st_ino == source.st_ino))))
+			continue;
+		found = TRUE;
+		*mnt_flags = NTFS_MF_MOUNTED;
+		if (!strcmp(mnt->mnt_dir, "/"))
+			*mnt_flags |= NTFS_MF_ISROOT;
 #ifdef HAVE_HASMNTOPT
-	if (hasmntopt(mnt, "ro") && !hasmntopt(mnt, "rw"))
-		*mnt_flags |= NTFS_MF_READONLY;
+		if (hasmntopt(mnt, "ro") && !hasmntopt(mnt, "rw"))
+			*mnt_flags |= NTFS_MF_READONLY;
 #endif
+		break;
+	}
+	if (!found && ferror(f))
+		err = errno ? errno : EIO;
+	endmntent(f);
 exit:
 	free(real_file);
 	free(real_fsname);

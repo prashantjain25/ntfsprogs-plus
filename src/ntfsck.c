@@ -3931,6 +3931,10 @@ static int32_t ntfsck_check_file_type(ntfs_inode *ni, ntfs_index_context *ictx,
 						fsck_err_fixed();
 				}
 			}
+		} else if (ni->mft_no == FILE_Secure && vol->major_ver >= 3) {
+			/* $Secure has named $SDS/$SII/$SDH, not a required unnamed $DATA.
+			 * Its named streams and indexes are checked by ntfsck_check_secure(). */
+			return (int32_t)ie_flags;
 		} else {
 			if (check_ir == TRUE) {
 				/*
@@ -8634,16 +8638,14 @@ static BOOL ntfsck_repair_enabled(void)
 }
 
 /*
- * ntfsck_begin_repair - open a crash-safe repair transaction.
+ * ntfsck_begin_repair - mark repair in progress before the repair passes.
  *
- * Before the first repair write, durably record on disk that a repair is in
- * progress by making sure VOLUME_IS_DIRTY is set and flushed. If ntfsck is
+ * Before the repair passes, record on disk that a repair is in progress by
+ * making sure VOLUME_IS_DIRTY is set and flushed. If ntfsck is
  * then interrupted, the volume stays marked dirty and is re-checked on the
- * next run instead of being trusted as clean. This is the same fail-safe
- * guarantee a write-ahead log provides - an interrupted repair never leaves
- * the volume advertised as consistent - enforced here at the volume level.
- * The matching commit is ntfsck_reset_dirty(), which only runs after all
- * repair writes have been flushed (see main()).
+ * next run instead of being trusted as clean. This marker is not a
+ * write-ahead log and does not make multi-record repairs atomic. Repairs
+ * performed while opening the volume are outside this guard.
  */
 static int ntfsck_begin_repair(ntfs_volume *vol)
 {
@@ -8661,8 +8663,10 @@ static int ntfsck_begin_repair(ntfs_volume *vol)
 	}
 
 	/* Make the in-progress marker durable before touching metadata. */
-	if (ntfsck_device_sync(vol))
-		ntfs_log_verbose("Warning: could not flush the dirty marker.\n");
+	if (ntfsck_device_sync(vol)) {
+		ntfs_log_error("Failed to flush the dirty marker.\n");
+		return STATUS_ERROR;
+	}
 
 	return STATUS_OK;
 }
@@ -8682,9 +8686,10 @@ static int ntfsck_reset_dirty(ntfs_volume *vol)
 	 * power loss between clearing the flag and flushing the data would
 	 * leave a "clean" but inconsistent volume.
 	 */
-	if (ntfsck_device_sync(vol))
-		ntfs_log_verbose("Warning: device sync before clearing dirty "
-				"flag failed.\n");
+	if (ntfsck_device_sync(vol)) {
+		ntfs_log_error("Device sync before clearing dirty flag failed.\n");
+		return STATUS_ERROR;
+	}
 
 	flags = vol->flags & ~VOLUME_IS_DIRTY;
 
@@ -11485,6 +11490,12 @@ static int ntfsck_run_repair_passes(ntfs_volume *vol, BOOL *orphan_changed)
 
 	/* pass 1 */
 	ntfsck_scan_mft_records(vol);
+	/* Conversion frees clusters; admission must not do this before these maps exist. */
+	if (!fsck_scan_eio && !vol->fsck_lcn_range_dup_count &&
+			ntfs_volume_fix_txf_data(vol)) {
+		ret = -1;
+		goto out;
+	}
 
 	/* pass 2 */
 	if (ntfsck_check_system_files(vol)) {
@@ -11780,6 +11791,8 @@ conflict_option:
 	if (optind != argc - 1)
 		usage(1);
 	path = argv[optind];
+	if (opt_force)
+		option.flags |= NTFS_MNT_FORCE_HIBERFILE;
 
 	if (!ntfs_check_if_mounted(path, &mnt_flags)) {
 		if ((mnt_flags & NTFS_MF_MOUNTED)) {
@@ -11795,9 +11808,11 @@ conflict_option:
 				exit(1);
 			}
 		}
-	} else
+	} else {
 		ntfs_log_perror("Failed to determine whether %s is mounted",
 				path);
+		return RETURN_OPERATIONAL_ERROR;
+	}
 
 	vol = ntfs_fsck_mount(path, option.flags);
 	if (!vol) {
@@ -11819,7 +11834,7 @@ conflict_option:
 			fsck_err_found();
 		}
 
-		goto err_out;
+		goto operational_error;
 	}
 
 	/* Just return the volume dirty flags when '-C' option is specified. */
@@ -11840,8 +11855,13 @@ conflict_option:
 	 * the repair modes and let only the read-only check proceed.
 	 */
 	errno = 0;
-	if (ntfs_volume_check_hiberfile(vol, 0) < 0 && errno == EPERM) {
-		if (ntfsck_repair_enabled() && !opt_force) {
+	if (ntfs_volume_check_hiberfile(vol, 0) < 0) {
+		if (errno != EPERM) {
+			ntfs_log_perror("Cannot establish hiberfil.sys state");
+			if (ntfsck_repair_enabled())
+				goto operational_error;
+		}
+		else if (ntfsck_repair_enabled() && !opt_force) {
 			ntfs_log_error("Windows is hibernated on %s. Resume and "
 					"shut down Windows fully (no hibernation "
 					"or fast restarting), then run ntfsck "
@@ -11851,14 +11871,16 @@ conflict_option:
 			ntfs_fsck_umount(vol);
 			return RETURN_OPERATIONAL_ERROR;
 		}
-		if (ntfsck_repair_enabled()) {
+		else if (ntfsck_repair_enabled()) {
 			ntfs_log_warning("Windows is hibernated on %s; forced "
 					"repair requested, discarding the "
 					"hibernation image.\n", path);
-			if (ntfs_volume_invalidate_hiberfile(vol))
+			if (ntfs_volume_invalidate_hiberfile(vol)) {
 				ntfs_log_perror("Failed to invalidate "
 						"hiberfil.sys; Windows may "
 						"try to resume from it");
+				goto operational_error;
+			}
 		} else
 			ntfs_log_warning("Windows is hibernated; the volume "
 					"reflects the state of a suspended "
@@ -11908,11 +11930,11 @@ conflict_option:
 			vol->fsck_lcn_range_dup_count = 0;
 			ntfsck_check_backup_boot(vol);
 
-			/* Open a crash-safe repair transaction before any write. */
-			ntfsck_begin_repair(vol);
+			if (ntfsck_begin_repair(vol))
+				goto operational_error;
 
 			if (ntfsck_run_repair_passes(vol, &orphan_changed))
-				goto err_out;
+				goto operational_error;
 			if (orphan_changed) {
 				if (have_prev_orphan_candidates &&
 						orphan_cnt >= prev_orphan_candidates) {
@@ -11980,8 +12002,12 @@ conflict_option:
 					"(round %d)...\n", round + 2);
 
 			/* Re-mount for a fresh, self-consistent fsck state. */
-			ntfs_fsck_umount(vol);
+			ret = ntfs_fsck_umount(vol);
 			vol = NULL;
+			if (ret) {
+				ntfs_log_error("Failed to finalize repair round.\n");
+				goto operational_error;
+			}
 			total_errors += fsck_errors;
 			total_fixes += fsck_fixes;
 			fsck_errors = 0;
@@ -12011,23 +12037,41 @@ err_out:
 	total_errors += fsck_errors;
 	total_fixes += fsck_fixes;
 	if (errors) {
-		ntfs_log_info("%d errors left (errors:%d, fixed:%d)\n",
-				errors, total_errors, total_fixes);
 		ret = RETURN_FS_ERRORS_LEFT_UNCORRECTED;
 	} else {
-		ntfs_log_info("Clean, No errors found or left (errors:%d, fixed:%d)\n",
-				total_errors, total_fixes);
 		if (total_fixes)
 			ret = RETURN_FS_ERRORS_CORRECTED;
 		else
 			ret = RETURN_FS_NO_ERRORS;
 	}
 
-	if (!errors && vol)
-		ntfsck_reset_dirty(vol);
+	if (!errors && vol && ntfsck_repair_enabled() && ntfsck_reset_dirty(vol))
+		goto operational_error;
 
-	if (vol)
-		ntfs_fsck_umount(vol);
+	if (vol) {
+		int unmount_ret = ntfs_fsck_umount(vol);
+
+		vol = NULL;
+		if (unmount_ret) {
+			ntfs_log_error("Failed to finalize volume.\n");
+			goto operational_error;
+		}
+	}
+
+	if (errors)
+		ntfs_log_info("%d errors left (errors:%d, fixed:%d)\n",
+				errors, total_errors, total_fixes);
+	else
+		ntfs_log_info("Clean, No errors found or left (errors:%d, fixed:%d)\n",
+				total_errors, total_fixes);
 
 	return ret;
+operational_error:
+	if (vol) {
+		/* Cleanup must not retry dirty metadata after a terminal failure. */
+		NVolSetReadOnly(vol);
+		NDevSetReadOnly(vol->dev);
+		ntfs_fsck_umount(vol);
+	}
+	return RETURN_OPERATIONAL_ERROR;
 }
