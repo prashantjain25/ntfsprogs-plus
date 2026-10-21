@@ -120,6 +120,7 @@ enum {
 	NTFS_MNT_EXCLUSIVE              = 0x08000000,
 	NTFS_MNT_RECOVER                = 0x10000000,
 	NTFS_MNT_IGNORE_HIBERFILE       = 0x20000000,
+	NTFS_MNT_FORCE_HIBERFILE        = 0x40000000, /* discard a known active image */
 };
 typedef unsigned long ntfs_mount_flags;
 
@@ -421,6 +422,7 @@ extern int ntfs_umount(ntfs_volume *vol, const BOOL force);
 extern int ntfs_version_is_supported(ntfs_volume *vol);
 extern int ntfs_volume_check_hiberfile(ntfs_volume *vol, int verbose);
 extern int ntfs_volume_invalidate_hiberfile(ntfs_volume *vol);
+extern int ntfs_volume_fix_txf_data(ntfs_volume *vol);
 extern int ntfs_logfile_reset(ntfs_volume *vol);
 
 extern int ntfs_volume_write_flags(ntfs_volume *vol, const le16 flags);

@@ -113,6 +113,7 @@ typedef enum {
 	PR_NAMESPACE_WALK_INCOMPLETE,
 	PR_NAMESPACE_RECORD_UNREACHABLE,
 	PR_NAMESPACE_LINK_COUNT_MISMATCH,
+	PR_ROOT_TXF_NONRESIDENT,
 } problem_code_t;
 
 typedef struct problem_context {
