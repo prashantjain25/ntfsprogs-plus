@@ -23,6 +23,7 @@
 #endif
 #ifdef HAVE_FCNTL_H
 #include <fcntl.h>
+#include <device_io.h>
 #endif
 
 #include <layout.h>
@@ -8634,6 +8635,652 @@ static BOOL ntfsck_repair_enabled(void)
 }
 
 /*
+ * Read-only hibernation admission.
+ *
+ * The check reads the volume straight from the device. It does not mount the
+ * volume and never writes, so damage that stops a mount (the boot sector,
+ * $MFT record 0 or $UpCase) does not hide the hibernation state:
+ *   - the backup boot sector is used when the primary one is damaged;
+ *   - the $MFTMirr copy of record 0 is used when $MFT record 0 is damaged.
+ * Every record and index block that is read must pass its signature check,
+ * its fixups and, where one is given, its sequence number. Anything that cannot
+ * be proven is HIBP_UNKNOWN, and an unknown state refuses the repair.
+ */
+
+#define HIBP_HEADER_SIZE	4096
+#define HIBP_MAX_DEPTH		32
+#define HIBP_ATTR_DATA		0x80
+#define HIBP_ATTR_INDEX_ROOT	0x90
+#define HIBP_ATTR_INDEX_ALLOC	0xa0
+#define HIBP_ROOT_RECORD	5
+
+enum hibp_state {
+	HIBP_CLEAR,		/* no hibernation file, or a header with no saved state */
+	HIBP_HIBERNATED,	/* the header carries a hibernation signature */
+	HIBP_SHORT,		/* the file is shorter than its header */
+	HIBP_BAD_HEADER,	/* the header is neither empty nor a known signature */
+	HIBP_UNKNOWN,		/* the state cannot be read without a repair */
+};
+
+struct hibp_run {
+	s64 vcn;	/* first cluster of the run */
+	s64 lcn;	/* first cluster on the device, -1 for a hole */
+	s64 len;	/* length in clusters */
+};
+
+struct hibp_ctx {
+	struct ntfs_device *dev;
+	s64 dev_size;
+	int cs;			/* cluster size in bytes */
+	int rec;		/* MFT record size in bytes */
+	int ib;			/* index block size in bytes */
+	int ib_in_clusters;	/* index block VCNs count clusters, not sectors */
+	s64 mft_lcn;
+	s64 mirr_lcn;
+	struct hibp_run *mft;	/* runs of $MFT */
+	int nmft;
+	struct hibp_run *idx;	/* runs of the root directory $I30 allocation */
+	int nidx;
+	int hits;		/* root entries named hiberfil.sys */
+	u64 hit_ref;		/* MFT reference of the first such entry */
+	int ambiguous;		/* an entry that cannot be compared exactly */
+};
+
+static const u8 hibp_i30[8] = { '$', 0, 'I', 0, '3', 0, '0', 0 };
+
+static u16 hibp_u16(const u8 *p)
+{
+	return (u16)(p[0] | (p[1] << 8));
+}
+
+static u32 hibp_u32(const u8 *p)
+{
+	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) |
+			((u32)p[3] << 24);
+}
+
+static u64 hibp_u64(const u8 *p)
+{
+	return hibp_u32(p) | ((u64)hibp_u32(p + 4) << 32);
+}
+
+/* Read exactly @count bytes at byte @offset of the device. */
+static int hibp_read(struct hibp_ctx *c, void *buf, s64 count, s64 offset)
+{
+	u8 *p = buf;
+
+	if (offset < 0 || count < 0)
+		return -1;
+	while (count > 0) {
+		s64 r = c->dev->d_ops->pread(c->dev, p, count, offset);
+
+		if (r <= 0)
+			return -1;
+		p += r;
+		offset += r;
+		count -= r;
+	}
+	return 0;
+}
+
+/* Read @count bytes at byte @pos of an attribute whose runs are given. */
+static int hibp_read_runs(struct hibp_ctx *c, const struct hibp_run *runs,
+		int nruns, s64 pos, s64 count, u8 *buf)
+{
+	if (pos < 0)
+		return -1;
+	while (count > 0) {
+		s64 vcn = pos / c->cs;
+		s64 within = pos % c->cs;
+		s64 chunk = c->cs - within;
+		int i;
+
+		if (chunk > count)
+			chunk = count;
+		for (i = 0; i < nruns; i++)
+			if (vcn >= runs[i].vcn && vcn < runs[i].vcn + runs[i].len)
+				break;
+		if (i == nruns)
+			return -1;
+		if (runs[i].lcn < 0)
+			memset(buf, 0, (size_t)chunk);
+		else if (hibp_read(c, buf, chunk,
+				(runs[i].lcn + vcn - runs[i].vcn) * c->cs +
+				within))
+			return -1;
+		buf += chunk;
+		pos += chunk;
+		count -= chunk;
+	}
+	return 0;
+}
+
+/* Decode a mapping pairs array. Returns 0 and allocates *out on success. */
+static int hibp_decode_runs(const u8 *p, const u8 *end,
+		struct hibp_run **out, int *nout)
+{
+	struct hibp_run *runs = NULL;
+	int n = 0, cap = 0;
+	s64 vcn = 0, lcn = 0;
+
+	while (p < end && *p) {
+		int lenlen = *p & 0x0f;
+		int offlen = *p >> 4;
+		u64 len = 0, off = 0;
+		int i;
+
+		if (!lenlen || lenlen > 8 || offlen > 8 ||
+				p + 1 + lenlen + offlen > end)
+			goto bad;
+		p++;
+		for (i = 0; i < lenlen; i++)
+			len |= (u64)p[i] << (8 * i);
+		p += lenlen;
+		for (i = 0; i < offlen; i++)
+			off |= (u64)p[i] << (8 * i);
+		if (offlen && offlen < 8 && (p[offlen - 1] & 0x80))
+			off |= ~0ULL << (8 * offlen);
+		p += offlen;
+		if (!len || len > (u64)INT64_MAX)
+			goto bad;
+		if (offlen) {
+			lcn += (s64)off;
+			if (lcn < 0)
+				goto bad;
+		}
+		if (n == cap) {
+			struct hibp_run *t;
+
+			cap = cap ? 2 * cap : 16;
+			t = realloc(runs, cap * sizeof(*runs));
+			if (!t)
+				goto bad;
+			runs = t;
+		}
+		runs[n].vcn = vcn;
+		runs[n].lcn = offlen ? lcn : -1;
+		runs[n].len = (s64)len;
+		n++;
+		vcn += (s64)len;
+	}
+	if (!n)
+		goto bad;
+	*out = runs;
+	*nout = n;
+	return 0;
+bad:
+	free(runs);
+	return -1;
+}
+
+/*
+ * Find the first attribute of @type with the name @name (@namelen UTF-16
+ * units) in a verified record. Returns 0 when found, 1 when absent and -1 when
+ * the attribute list is malformed.
+ */
+static int hibp_find_attr(const u8 *rec, int recsize, u32 type,
+		const u8 *name, u32 namelen, const u8 **attr)
+{
+	u32 used = hibp_u32(rec + 24);
+	u32 off = hibp_u16(rec + 20);
+
+	if (used > (u32)recsize)
+		return -1;
+	while (off + 8 <= used) {
+		u32 t = hibp_u32(rec + off);
+		u32 len, nl, noff;
+
+		if (t == 0xffffffff)
+			return 1;
+		len = hibp_u32(rec + off + 4);
+		if (len < 16 || (len & 7) || len > used - off)
+			return -1;
+		nl = rec[off + 9];
+		noff = hibp_u16(rec + off + 10);
+		if (t == type && nl == namelen && noff + 2 * nl <= len &&
+				(!nl || !memcmp(rec + off + noff, name, 2 * nl))) {
+			*attr = rec + off;
+			return 0;
+		}
+		off += len;
+	}
+	return 1;
+}
+
+/* Value of a resident attribute. */
+static int hibp_attr_value(const u8 *a, const u8 **value, u32 *vlen)
+{
+	u32 len = hibp_u32(a + 4);
+	u32 n, off;
+
+	if (a[8] || len < 24)
+		return -1;
+	n = hibp_u32(a + 16);
+	off = hibp_u16(a + 20);
+	if (off > len || n > len - off)
+		return -1;
+	*value = a + off;
+	*vlen = n;
+	return 0;
+}
+
+/* Runs and real size of a non-resident attribute. */
+static int hibp_attr_runs(const u8 *a, struct hibp_run **runs, int *nruns,
+		s64 *size)
+{
+	u32 len = hibp_u32(a + 4);
+	u32 mpo;
+
+	if (!a[8] || len < 64)
+		return -1;
+	mpo = hibp_u16(a + 32);
+	if (mpo < 64 || mpo > len)
+		return -1;
+	*size = (s64)hibp_u64(a + 48);
+	return hibp_decode_runs(a + mpo, a + len, runs, nruns);
+}
+
+/* Signature and fixups of a multi-sector structure of @size bytes. */
+static int hibp_check_record(u8 *rec, u32 size, const char *magic)
+{
+	if (memcmp(rec, magic, 4))
+		return -1;
+	return ntfs_mst_post_read_fixup_warn((NTFS_RECORD *)rec, size, 0) ?
+			-1 : 0;
+}
+
+/* MFT record @recno, found through the runs of $MFT. */
+static int hibp_get_record(struct hibp_ctx *c, u64 recno, u8 *rec)
+{
+	if (recno > ((u64)1 << 40))
+		return -1;
+	if (hibp_read_runs(c, c->mft, c->nmft, (s64)recno * c->rec, c->rec,
+			rec))
+		return -1;
+	return hibp_check_record(rec, c->rec, "FILE");
+}
+
+/*
+ * Load the runs of $MFT from record 0. The primary record is used when it
+ * verifies, otherwise the $MFTMirr copy.
+ */
+static int hibp_load_mft(struct hibp_ctx *c, u8 *rec)
+{
+	s64 starts[2];
+	int i;
+
+	starts[0] = c->mft_lcn * c->cs;
+	starts[1] = c->mirr_lcn * c->cs;
+	for (i = 0; i < 2; i++) {
+		struct hibp_run *runs;
+		const u8 *a;
+		int nruns;
+		s64 size;
+
+		if (hibp_read(c, rec, c->rec, starts[i]) ||
+				hibp_check_record(rec, c->rec, "FILE"))
+			continue;
+		if (hibp_find_attr(rec, c->rec, HIBP_ATTR_DATA, NULL, 0, &a))
+			continue;
+		if (hibp_attr_runs(a, &runs, &nruns, &size))
+			continue;
+		c->mft = runs;
+		c->nmft = nruns;
+		return 0;
+	}
+	return -1;
+}
+
+static int hibp_boot_valid(const u8 *bs)
+{
+	int bps = hibp_u16(bs + 0x0b);
+	int spc = bs[0x0d];
+
+	if (bs[510] != 0x55 || bs[511] != 0xaa ||
+			memcmp(bs + 3, "NTFS    ", 8))
+		return 0;
+	if (bps < 512 || bps > 4096 || (bps & (bps - 1)))
+		return 0;
+	if (!spc || (spc & (spc - 1)) || bps * spc > 65536)
+		return 0;
+	return 1;
+}
+
+/*
+ * Geometry from the primary boot sector, or from the backup boot sector in the
+ * last sector of the volume when the primary one is damaged. The backup holds
+ * the number of the last sector in its sector count field, which is checked.
+ */
+static int hibp_boot(struct hibp_ctx *c)
+{
+	static const int sizes[4] = { 512, 1024, 2048, 4096 };
+	u8 bs[512];
+	int i, found = 0, cpr, spc, bps;
+
+	if (!hibp_read(c, bs, sizeof(bs), 0) && hibp_boot_valid(bs))
+		found = 1;
+	for (i = 0; !found && i < 4; i++) {
+		s64 off = c->dev_size - sizes[i];
+
+		if (off <= 0 || hibp_read(c, bs, sizeof(bs), off))
+			continue;
+		if (!hibp_boot_valid(bs) || hibp_u16(bs + 0x0b) != sizes[i])
+			continue;
+		if (hibp_u64(bs + 0x28) != (u64)(off / sizes[i]))
+			continue;
+		found = 1;
+	}
+	if (!found)
+		return -1;
+
+	bps = hibp_u16(bs + 0x0b);
+	spc = bs[0x0d];
+	c->cs = bps * spc;
+	cpr = (signed char)bs[0x40];
+	if (cpr > 0)
+		c->rec = cpr * c->cs;
+	else if (cpr < 0 && cpr >= -16)
+		c->rec = 1 << -cpr;
+	else
+		return -1;
+	if (c->rec < 512 || c->rec > 65536)
+		return -1;
+	c->mft_lcn = (s64)hibp_u64(bs + 0x30);
+	c->mirr_lcn = (s64)hibp_u64(bs + 0x38);
+	if (c->mft_lcn <= 0 || c->mirr_lcn <= 0 ||
+			c->mft_lcn >= c->dev_size / c->cs ||
+			c->mirr_lcn >= c->dev_size / c->cs)
+		return -1;
+	return 0;
+}
+
+static int hibp_walk(struct hibp_ctx *c, const u8 *p, const u8 *end,
+		int depth);
+
+/* Index block at VCN @vcn of the root directory, walked recursively. */
+static int hibp_index_block(struct hibp_ctx *c, s64 vcn, int depth)
+{
+	const u8 *node;
+	u8 *buf;
+	u32 eoff, ilen;
+	s64 pos;
+	int r = -1;
+
+	if (!c->nidx || vcn < 0 || vcn > ((s64)1 << 40))
+		return -1;
+	buf = malloc(c->ib);
+	if (!buf)
+		return -1;
+	pos = c->ib_in_clusters ? vcn * c->cs : vcn * 512;
+	if (hibp_read_runs(c, c->idx, c->nidx, pos, c->ib, buf))
+		goto out;
+	if (hibp_check_record(buf, c->ib, "INDX") ||
+			hibp_u64(buf + 16) != (u64)vcn)
+		goto out;
+	node = buf + 24;
+	eoff = hibp_u32(node);
+	ilen = hibp_u32(node + 4);
+	if (ilen > (u32)c->ib - 24 || eoff > ilen)
+		goto out;
+	r = hibp_walk(c, node + eoff, node + ilen, depth);
+out:
+	free(buf);
+	return r;
+}
+
+/* One index key. Only names of the root directory are compared. */
+static int hibp_key(struct hibp_ctx *c, u64 ref, const u8 *key, u32 klen)
+{
+	static const char want[] = "HIBERFIL.SYS";
+	u32 nlen;
+	int i;
+
+	if (klen < 66)
+		return -1;
+	nlen = key[64];
+	if (klen < 66 + 2 * nlen)
+		return -1;
+	if ((hibp_u64(key) & 0xffffffffffffULL) != (u64)HIBP_ROOT_RECORD || nlen != 12)
+		return 0;
+	for (i = 0; i < 12; i++) {
+		if (hibp_u16(key + 66 + 2 * i) >= 128) {
+			c->ambiguous = 1;
+			return 0;
+		}
+	}
+	for (i = 0; i < 12; i++) {
+		int a = hibp_u16(key + 66 + 2 * i);
+		int b = (unsigned char)want[i];
+
+		if (a >= 'a' && a <= 'z')
+			a -= 32;
+		if (b >= 'a' && b <= 'z')
+			b -= 32;
+		if (a != b)
+			return 0;
+	}
+	if (!c->hits)
+		c->hit_ref = ref;
+	else if ((ref & 0xffffffffffffULL) !=
+			(c->hit_ref & 0xffffffffffffULL))
+		c->ambiguous = 1;
+	c->hits++;
+	return 0;
+}
+
+/* Walk one B+ tree node and, through its sub-node pointers, its children. */
+static int hibp_walk(struct hibp_ctx *c, const u8 *p, const u8 *end,
+		int depth)
+{
+	int last = 0;
+
+	if (depth > HIBP_MAX_DEPTH)
+		return -1;
+	while (!last) {
+		u32 len, klen, flags;
+
+		if (end - p < 16)
+			return -1;
+		len = hibp_u16(p + 8);
+		klen = hibp_u16(p + 10);
+		flags = hibp_u16(p + 12);
+		if (len < 16 || (len & 7) || len > (u32)(end - p) ||
+				klen > len - 16)
+			return -1;
+		last = flags & 2;
+		if (!last && hibp_key(c, hibp_u64(p), p + 16, klen))
+			return -1;
+		if (flags & 1) {
+			if (len < 24)
+				return -1;
+			if (hibp_index_block(c, (s64)hibp_u64(p + len - 8),
+					depth + 1))
+				return -1;
+		}
+		p += len;
+	}
+	return 0;
+}
+
+/* Classify the header of hiberfil.sys, with the same rule as the mount. */
+static enum hibp_state hibp_classify(const u8 *buf, s64 size)
+{
+	int k;
+
+	if (size < HIBP_HEADER_SIZE)
+		return HIBP_SHORT;
+	if (!memcmp(buf, "hibr", 4) || !memcmp(buf, "HIBR", 4))
+		return HIBP_HIBERNATED;
+	for (k = 0; k < HIBP_HEADER_SIZE; k++)
+		if (buf[k])
+			return HIBP_BAD_HEADER;
+	return HIBP_CLEAR;
+}
+
+/* Read the header of the hiberfil.sys record @ref and classify it. */
+static enum hibp_state hibp_file(struct hibp_ctx *c, u64 ref, u8 *rec)
+{
+	u8 buf[HIBP_HEADER_SIZE];
+	struct hibp_run *runs = NULL;
+	const u8 *a, *value;
+	int nruns = 0;
+	u32 vlen;
+	s64 size, want;
+	enum hibp_state st = HIBP_UNKNOWN;
+
+	if (hibp_get_record(c, ref & 0xffffffffffffULL, rec))
+		return HIBP_UNKNOWN;
+	if (!(rec[22] & 1))
+		return HIBP_UNKNOWN;
+	if ((ref >> 48) && hibp_u16(rec + 16) != (u16)(ref >> 48))
+		return HIBP_UNKNOWN;
+	if (hibp_u64(rec + 32) & 0xffffffffffffULL)
+		return HIBP_UNKNOWN;	/* an extension record */
+	if (hibp_find_attr(rec, c->rec, HIBP_ATTR_DATA, NULL, 0, &a))
+		return HIBP_UNKNOWN;
+
+	memset(buf, 0, sizeof(buf));
+	if (!a[8]) {
+		if (hibp_attr_value(a, &value, &vlen))
+			return HIBP_UNKNOWN;
+		size = vlen;
+		want = size < HIBP_HEADER_SIZE ? size : HIBP_HEADER_SIZE;
+		memcpy(buf, value, (size_t)want);
+	} else {
+		if (hibp_attr_runs(a, &runs, &nruns, &size))
+			return HIBP_UNKNOWN;
+		want = size < HIBP_HEADER_SIZE ? size : HIBP_HEADER_SIZE;
+		if (want > 0 && hibp_read_runs(c, runs, nruns, 0, want, buf))
+			goto out;
+	}
+	st = hibp_classify(buf, size);
+out:
+	free(runs);
+	return st;
+}
+
+/* Scan the root directory for hiberfil.sys and classify it. */
+static enum hibp_state hibp_scan(struct hibp_ctx *c, u8 *rec)
+{
+	const u8 *a, *v, *node;
+	struct hibp_run *runs;
+	u32 vlen, eoff, ilen;
+	int nruns, r;
+	s64 size;
+
+	if (hibp_get_record(c, HIBP_ROOT_RECORD, rec) || (rec[22] & 3) != 3)
+		return HIBP_UNKNOWN;
+	if (hibp_find_attr(rec, c->rec, HIBP_ATTR_INDEX_ROOT, hibp_i30, 4,
+			&a))
+		return HIBP_UNKNOWN;
+	if (hibp_attr_value(a, &v, &vlen) || vlen < 32)
+		return HIBP_UNKNOWN;
+	c->ib = (int)hibp_u32(v + 8);
+	if (c->ib < 512 || c->ib > 65536)
+		return HIBP_UNKNOWN;
+	c->ib_in_clusters = (signed char)v[12] > 0;
+	node = v + 16;
+	eoff = hibp_u32(node);
+	ilen = hibp_u32(node + 4);
+	if (ilen > vlen - 16 || eoff > ilen)
+		return HIBP_UNKNOWN;
+
+	r = hibp_find_attr(rec, c->rec, HIBP_ATTR_INDEX_ALLOC, hibp_i30, 4,
+			&a);
+	if (r == 0) {
+		if (hibp_attr_runs(a, &runs, &nruns, &size))
+			return HIBP_UNKNOWN;
+		c->idx = runs;
+		c->nidx = nruns;
+	} else if (r < 0) {
+		return HIBP_UNKNOWN;
+	}
+	if (hibp_walk(c, node + eoff, node + ilen, 0) || c->ambiguous)
+		return HIBP_UNKNOWN;
+	if (!c->hits)
+		return HIBP_CLEAR;
+	return hibp_file(c, c->hit_ref, rec);
+}
+
+/* Probe the device. Nothing is written. */
+static enum hibp_state hibp_probe(const char *path)
+{
+	struct hibp_ctx c;
+	enum hibp_state st = HIBP_UNKNOWN;
+	s64 blocks;
+	u8 *rec = NULL;
+	int opened = 0;
+
+	memset(&c, 0, sizeof(c));
+	c.dev = ntfs_device_alloc(path, 0, &ntfs_device_default_io_ops, NULL);
+	if (!c.dev)
+		return HIBP_UNKNOWN;
+	if (c.dev->d_ops->open(c.dev, O_RDONLY))
+		goto out;
+	opened = 1;
+	blocks = ntfs_device_size_get(c.dev, 512);
+	if (blocks <= 0)
+		goto out;
+	c.dev_size = blocks * 512;
+	if (hibp_boot(&c))
+		goto out;
+	rec = malloc(c.rec);
+	if (!rec)
+		goto out;
+	if (hibp_load_mft(&c, rec))
+		goto out;
+	st = hibp_scan(&c, rec);
+out:
+	free(rec);
+	free(c.mft);
+	free(c.idx);
+	if (opened)
+		c.dev->d_ops->close(c.dev);
+	ntfs_device_free(c.dev);
+	return st;
+}
+
+/*
+ * Read-only admission check, run before any writable mount in a repair mode.
+ * A writable mount can already write (for example a log reset), so the
+ * hibernation decision is made from a read-only probe of the device first.
+ * Returns 0 when the repair may proceed, -1 when it must be refused.
+ */
+static int ntfsck_admit_hiberfile(const char *path)
+{
+	switch (hibp_probe(path)) {
+	case HIBP_CLEAR:
+		return 0;
+	case HIBP_HIBERNATED:
+		if (opt_force)
+			return 0;	/* forced: the post-mount step discards the image */
+		ntfs_log_error("Windows is hibernated on %s. Resume and shut down Windows fully "
+				"(no hibernation or fast restarting), then run ntfsck again, or force "
+				"the repair with -f (discards the hibernated state). No repair was done.\n",
+				path);
+		return -1;
+	case HIBP_SHORT:
+		if (opt_force)
+			return 0;
+		ntfs_log_error("The hibernation file of %s is shorter than its header, so it cannot "
+				"be checked. Force the repair with -f (discards the saved state), or "
+				"fix the volume first. No repair was done.\n", path);
+		return -1;
+	case HIBP_BAD_HEADER:
+		if (opt_force)
+			return 0;
+		ntfs_log_error("The hibernation file header of %s is not recognized. Force the repair "
+				"with -f (discards the saved state), or fix the volume first. No repair "
+				"was done.\n", path);
+		return -1;
+	default:
+		ntfs_log_error("The hibernation state of %s could not be determined. No repair was done.\n",
+				path);
+		return -1;
+	}
+}
+
+/*
  * ntfsck_begin_repair - open a crash-safe repair transaction.
  *
  * Before the first repair write, durably record on disk that a repair is in
@@ -11801,6 +12448,10 @@ conflict_option:
 	} else
 		ntfs_log_perror("Failed to determine whether %s is mounted",
 				path);
+
+	/* Decide the hibernation state before any writable mount. */
+	if (ntfsck_repair_enabled() && ntfsck_admit_hiberfile(path))
+		return RETURN_OPERATIONAL_ERROR;
 
 	vol = ntfs_fsck_mount(path, option.flags);
 	if (!vol) {

@@ -1195,6 +1195,7 @@ int ntfs_volume_check_hiberfile(ntfs_volume *vol, int verbose)
 	ntfs_attr *na = NULL;
 	int bytes_read, err;
 	char *buf = NULL;
+	int k;
 
 	ni = ntfs_hiberfile_open(vol);
 	if (!ni) {
@@ -1232,7 +1233,16 @@ int ntfs_volume_check_hiberfile(ntfs_volume *vol, int verbose)
 		errno = EPERM;
 		goto out;
 	}
-	/* All right, all header bytes are zero */
+	/* Only an all-zero header means the volume is not hibernated. */
+	for (k = 0; k < NTFS_HIBERFILE_HEADER_SIZE; k++)
+		if (buf[k])
+			break;
+	if (k < NTFS_HIBERFILE_HEADER_SIZE) {
+		if (verbose)
+			ntfs_log_error("Hibernation file header is not recognized, refused to mount.\n");
+		errno = EPERM;
+		goto out;
+	}
 	errno = 0;
 out:
 	if (na)
