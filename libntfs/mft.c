@@ -429,10 +429,16 @@ int ntfs_mft_record_check(ntfs_volume *vol, const MFT_REF mref,
 			/* IS_4 and IS_VIEW_INDEX cannot be derived from attributes; carry as-is */
 			expected_flags |= current_flags & (le16_to_cpu(MFT_RECORD_IS_4) |
 					le16_to_cpu(MFT_RECORD_IS_VIEW_INDEX));
-			if (saw_i30_index) {
+			/*
+			 * The base record says whether the file is a directory.
+			 * An extension record holds only some attributes, so
+			 * its $I30 index or unnamed $DATA says nothing about
+			 * the file. Keep its directory bit as found.
+			 */
+			if (!m->base_mft_record && saw_i30_index) {
 				can_derive_directory = TRUE;
 				expected_flags |= le16_to_cpu(MFT_RECORD_IS_DIRECTORY);
-			} else if (saw_unnamed_data) {
+			} else if (!m->base_mft_record && saw_unnamed_data) {
 				can_derive_directory = TRUE;
 			} else {
 				expected_flags |= current_flags &

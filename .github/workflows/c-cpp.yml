@@ -31,6 +31,8 @@ jobs:
       run: python3 tests/test_fsck_repairs.py --build-dir .
     - name: check journal recovery
       run: python3 tests/test_fsck_journal.py --build-dir .
+    - name: check MFT extension record flags
+      run: python3 tests/test_mft_extension_flags.py --build-dir .
     - name: check security descriptor layouts
       run: python3 tests/test_secure_descriptors.py --build-dir .
     - name: check external image runner
